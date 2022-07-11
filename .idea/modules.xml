@@ -3,6 +3,7 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/.idea/BAthesis_ZG.iml" filepath="$PROJECT_DIR$/.idea/BAthesis_ZG.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../sentence-transformers/.idea/sentence-transformers.iml" filepath="$PROJECT_DIR$/../sentence-transformers/.idea/sentence-transformers.iml" />
     </modules>
   </component>
 </project>

@@ -1,34 +1,23 @@
 import glob
 import math
 import statistics
-import random
 
-import pandas
-import torch
-import tensorflow as tf
 from sklearn.cluster import KMeans
+from sklearn.preprocessing import normalize
+from nltk.cluster import KMeansClusterer
+import nltk
 from transformers import BertTokenizer, BertForMaskedLM
 import csv
 import time
 import numpy as np
 from transformers import *
-import torch.nn.functional as F
-from sklearn.manifold import TSNE
-from numpy import dot
+
 from numpy.linalg import norm
-import copy
-import sklearn
-from sklearn.linear_model import LinearRegression, Ridge, SGDClassifier
-from sklearn.svm import LinearSVC, SVR
-import pandas as pd
+
 from collections import Counter
-from tqdm import tqdm
-import pickle
-import jsonlines
-from statistics import mean
+
 import argparse
-import collections
-import spacy
+
 import time
 import matplotlib.pyplot as plt
 
@@ -44,18 +33,17 @@ def sort_vocab(embed, output_embeddings):
 
 
 def sort_vocab_batch(embed, output_embeddings):
-    best = (np.argsort(np.dot(output_embeddings, embed.T),
-                       axis=0))  # notes: dot product of all the embeddings and one embedding. rank it in ascending order. The dot product of two normalized (unit) vectors will be a scalar value between -1 and 1.
+    best = (np.argsort(np.dot(output_embeddings, embed.T), axis=0))
+    # notes: dot product of all the embeddings and one embedding. rank it in ascending order.
+    # The dot product of two normalized (unit) vectors will be a scalar value between -1 and 1.
     return list(best.T)
 
 
-def sort_vocab_with_log_freq(embed, output_embeddings, tokenizer_mlm, word_log_freq_dict, binary_freq=False,
+def sort_vocab_with_log_freq(embed, base_word_token, output_embeddings, tokenizer_mlm, word_log_freq_dict,
+                             binary_freq=False,
                              norm_vec=True, square=True, norm_cos_sim_list=False, mean=None):
     assert mean in [None, 'geometric', 'harmonic'], 'mean could only be None, geometric or harmonic'
 
-    # start_time = time.time()
-    # print("sorting vocab")
-    # print(output_embeddings[0])
     if norm_vec:
         cos_sim_list = np.empty(len(output_embeddings))
         for i, emb in enumerate(output_embeddings):
@@ -66,9 +54,9 @@ def sort_vocab_with_log_freq(embed, output_embeddings, tokenizer_mlm, word_log_f
     else:
         cos_sim_list = np.dot(output_embeddings, embed.T)  # transform to 0-1. normalize each pair
 
-    # print("finish calculating cos similarity list", time.time()-start_time)
-    print("min_cos_sim: ", np.min(cos_sim_list))
-    print("max_cos_sim: ", np.max(cos_sim_list))
+    # Separate lists for this as one example for the normalization part in parameter selection
+    # print("min_cos_sim: ", np.min(cos_sim_list))
+    # print("max_cos_sim: ", np.max(cos_sim_list))
     if norm_cos_sim_list:
         min_val = np.min(cos_sim_list)
         max_val = np.max(cos_sim_list)
@@ -84,7 +72,7 @@ def sort_vocab_with_log_freq(embed, output_embeddings, tokenizer_mlm, word_log_f
 
     for i, cos_sim in enumerate(cos_sim_list):
         word_token = tokenizer_mlm.convert_ids_to_tokens(i)
-        if word_token in word_log_freq_dict:
+        if (word_token in word_log_freq_dict) and (word_token != base_word_token):
             rel_log_freq = word_log_freq_dict[word_token]
             if binary_freq:
                 rel_log_freq = 1.0
@@ -94,8 +82,9 @@ def sort_vocab_with_log_freq(embed, output_embeddings, tokenizer_mlm, word_log_f
             # geometric mean
             # print(cos_sim * rel_log_freq)
             if mean == "geometric":
-                if norm_cos_sim_list: # handle exception here?
-                    cos_sim_list[i] = math.sqrt(cos_sim * rel_log_freq)  # store the inverse log freq and use multiplication
+                if norm_cos_sim_list:  # handle exception here?
+                    cos_sim_list[i] = math.sqrt(
+                        cos_sim * rel_log_freq)  # store the inverse log freq and use multiplication
 
             # harmonic mean
             if mean == "harmonic":
@@ -106,7 +95,7 @@ def sort_vocab_with_log_freq(embed, output_embeddings, tokenizer_mlm, word_log_f
 
         else:
             # cos_sim_list[i] = np.divide(cos_sim, np.inf)
-            cos_sim_list[i] = 0.0  # the value...?
+            cos_sim_list[i] = 0.0
             # cos_sim_list[i] = np.divide(np.multiply(2, np.multiply(cos_sim_list[i], np.inf)),
             #                             np.sum(cos_sim_list[i], np.inf))
     # print("get best ranking", time.time()-start_time)
@@ -123,7 +112,7 @@ def average(lst):
     return sum(lst) / len(lst)
 
 
-def compute_log_frequency_for_lang(lang_word_list_path, base=10, sqrt=False, normalize=False):
+def compute_log_frequency_for_lang(lang_word_list_path, base=10, sqrt=False):
     # print("computing log frequency")
     # start_time = time.time()
     # read word list and count them
@@ -147,15 +136,7 @@ def compute_log_frequency_for_lang(lang_word_list_path, base=10, sqrt=False, nor
         if sqrt:
             inv_log_freq = math.sqrt(inv_log_freq)
         word_rel_log_freq[word] = inv_log_freq
-        # print(w[0])
-    # print(total)
-    # if sqrt and normalize:
-    #     min_val = min(word_rel_log_freq.values())
-    #     max_val = max(word_rel_log_freq.values())
-    #     for key, value in word_rel_log_freq.items():
-    #         word_rel_log_freq[key] = (value - min_val) / (max_val - min_val)
-    # print(word_rel_log_freq)
-    # print("finished", time.time()-start_time)
+
     return word_rel_log_freq
 
 
@@ -167,16 +148,13 @@ def get_average_vec_for_category(source_word, word_pair_list, tokenizer_mlm, out
     for w1, w2 in word_pair_list:
         if w1 == source_word:
             continue
-
         w1_id = tokenizer_mlm.encode(w1, add_special_tokens=False)
         w1_emb = output_embeddings[w1_id]
         if (len(w1_id) != 1):
-            # print("w1" + w1)
             continue
         w2_id = tokenizer_mlm.encode(w2, add_special_tokens=False)
         w2_emb = output_embeddings[w2_id]
         if (len(w2_id) != 1):
-            # print("w2" + w2)
             continue
         new_emb = w2_emb - w1_emb
         if w1 not in new_emb_dict:
@@ -192,9 +170,7 @@ def print_top_n_result(rank, tokenizer_mlm, n=20):
     output = ""
     for result_id in list(rank)[:n - 1]:
         result_id = result_id.item()
-        # print(type(result_id))
         output += tokenizer_mlm.convert_ids_to_tokens(result_id) + ", "
-        # print(len(tokenizer_mlm.decode(result_id)))
     print(output)
     print("")
 
@@ -225,12 +201,14 @@ def plot_annotate_top_n(source_word, target_word, best, cos_sim_list, word_list,
     if sort_cos_sim:
         # sort by cos sim
         highlights_x = [i for i, original_index in enumerate(best) if original_index in freq_indexes]
-        print("number of " + str(len(word_list)) + " most frequent words in " + str(show_top_n) + ": " + str(
-            len(highlights_x)))
+        # print("number of " + str(len(word_list)) + " most frequent words in " + str(show_top_n) + ": " + str(
+        #     len(highlights_x)))
+
         if len(highlights_x) > 0:
             print("mean: " + str(statistics.mean(highlights_x)))
             print("median: " + str(statistics.median(highlights_x)))
             # print("frequent word ranks: " + str(highlights_x))
+
         highlights_y = [cos_sim_list[best[i]] for i in highlights_x]
         plt.scatter(list(range(len(best))), ordered_cos_sim, s=s)
         plt.xlabel("sorted by cos sim")
@@ -283,16 +261,16 @@ def get_top_n_cos_sim(best, cos_sim_list, n=1000):
     return new_cos_dict
 
 
-def add_stats_to_list(l):
+def get_stats_for_list(l):
     copy = l.copy()
-    l.append(round(statistics.mean(copy), 3))
-    l.append(round(statistics.median(copy), 3))
-    l.append(round(statistics.stdev(copy), 3))
-    l.append(sum(i < 10 for i in copy))
-    l.append(sum(i < 20 for i in copy))
-    l.append(sum(i < 50 for i in copy))
-    l.append(sum(i < 100 for i in copy))
-    return l
+    stats = []
+    stats.append(round(statistics.mean(copy), 3))
+    stats.append(round(sum(i <= 1 for i in copy) / len(copy), 3))
+    stats.append(round(sum(i <= 10 for i in copy) / len(copy), 3))
+    stats.append(round(sum(i <= 50 for i in copy) / len(copy), 3))
+    stats.append(round(sum(i <= 100 for i in copy) / len(copy), 3))
+
+    return stats
 
 
 def is_single_token_word(word):
@@ -303,52 +281,102 @@ def is_single_token_word(word):
         return False
 
 
-def kmeans_cluster_diff_vectors(all_diff_vec_dict, number_of_categories):
+def get_all_diff_vecs(word_pair_list, tokenizer_mlm, output_embeddings):
+    word_pair_category_list = []  # for inspection
+    new_emb_list = []
+    for w1, w2 in word_pair_list:
+        w1_id = tokenizer_mlm.encode(w1, add_special_tokens=False)
+        w1_emb = output_embeddings[w1_id]
+
+        if len(w1_id) != 1:
+            continue
+        w2_id = tokenizer_mlm.encode(w2, add_special_tokens=False)
+        w2_emb = output_embeddings[w2_id]
+        if len(w2_id) != 1:
+            continue
+        diff_vec = w2_emb - w1_emb
+
+        new_emb_list.append(np.array(diff_vec))  # .reshape()
+        # new_emb_list.extend(np.array(diff_vec))
+    return new_emb_list
+
+
+def kmeans_cluster_diff_vectors(all_diff_vec_list, all_diff_vec_labels, number_of_categories, normalization=True,
+                                distance="cosine"):
+    assert normalization in [True, False], 'Normalization could only be True or False.'
+    assert distance in ['cosine', 'Euclidean'], 'distance could only be cosine or Euclidean.'
     num_clusters = number_of_categories
-    clustering_model = KMeans(n_clusters=num_clusters)
-    clustering_model.fit() # all the embeddings
-    # index all the embeddings
-    cluster_assignment = clustering_model.labels_
+    all_diff_vec_list = np.reshape(np.array(all_diff_vec_list), (len(all_diff_vec_list), 768))
+    clusters_assignment = []
+    if normalization:
+        all_diff_vec_list = normalize(all_diff_vec_list)
+    if distance == 'cosine':
+        cluster_model = KMeansClusterer(num_clusters, distance=nltk.cluster.util.cosine_distance, repeats=25, avoid_empty_clusters=True)
+        clusters_assignment = cluster_model.cluster(all_diff_vec_list, assign_clusters=True)
+
+    elif distance == 'Euclidean':
+        cluster_model = KMeans(n_clusters=num_clusters, random_state=7)  # , algorithm="elkan", n_init=50
+        cluster_model.fit(all_diff_vec_list)  # all the embeddings
+        clusters_assignment = cluster_model.labels_
 
     clustered_vectors = [[] for i in range(num_clusters)]
-    for vec_index, cluster_id in enumerate(cluster_assignment):
-        clustered_vectors[cluster_id].append([vec_index])
-        # need to give each diff vec a category and id
+    for vec_category_index, cl_id in enumerate(clusters_assignment):
+        clustered_vectors[cl_id].append(all_diff_vec_labels[vec_category_index]) # give each diff vec a category and id
 
-    for i, cluster in enumerate(clustered_vectors):
-        print("Cluster ", i + 1)
-        print(cluster)
-        print("")
+    category_total_counter = Counter([diff_vector for cluster in clustered_vectors for diff_vector in
+                                      cluster])  # get a total counter. {cluster id: total_number_of_vector in cluster}
+    # for each category, pick the main category: the majority located in which category.
+    category_distribution_in_clusters = {}  # {category: Counter({cluster_id: number of category})}.
+    # Get the main cluster automatically.(what if it is evenly distributed, then check the percentage)
+
+    for category in category_total_counter.keys():
+        if category not in category_distribution_in_clusters:
+            category_distribution_in_clusters[category] = Counter()
+
+    cluster_total_counter = {}
+    for i, cluster in enumerate(
+            clustered_vectors):  # loop over clusters. If it contain the category, add it to the category_distribution_in_clusters
+        cluster_id = i + 1
+        cluster_total_counter[cluster_id] = len(cluster)  # update cluster information in its total_counter
+        # show the description of the cluster: what and how? In what format?
+        cluster_counter = Counter(cluster)
+        for category in category_distribution_in_clusters.keys():
+            if category in cluster_counter:
+                category_cluster_counter = category_distribution_in_clusters[category]
+                dict.update(category_cluster_counter, [(cluster_id, cluster_counter[
+                    category])])  # update the category distribution values to include data for this cluster
+
+    all_main_clusters = []
+    print(distance+ ","+ str(normalization))
+    print("category,cluster_id,precision,recall,f_score")
+    for category in sorted(category_distribution_in_clusters.keys()):  # loop over category
+        category_total = category_total_counter[category]
+        main_cluster_counter = category_distribution_in_clusters[category].most_common(1)
+
+        # total number category and how much it is percentage
+        # check for evenly distributed among clusters
+        # get the data of main cluster
+        main_cluster_id = main_cluster_counter[0][0]
+        all_main_clusters.append(main_cluster_id)
+
+        true_positive = main_cluster_counter[0][1]  # true positive: dominating one, first one. might be equal special cases
+        false_positive = cluster_total_counter[main_cluster_id] - true_positive  # false positive: the remaining ones
+        false_negative = category_total - true_positive  # false negative: the total of the dominating category minus the number of it in this.
+
+        precision = round(true_positive / (true_positive + false_positive), 3) # Precision = TP/(TP + FP)
+        recall = round(true_positive / (true_positive + false_negative), 3)  # Recall = TP / (TP + FN)
+        f1_score = round(2 * (precision * recall)/(precision+recall), 3)
+
+        print(category + "," + str(main_cluster_id)+"," + str(precision) +"," + str(recall) +"," + str(f1_score))
+
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--extract_data", action="store_true",
-                        help="extract data from scratch (otherwise, load data from saved file)")
-    parser.add_argument("--all_langs", action="store_true", help="Translate from all langs to all langs")
-    parser.add_argument("--eval_pos", help="evaluate a specific pos tag: NOUN, VERB or ADJ")
-    args = parser.parse_args()
-
-    run_word_pair = False
-    run_category = True
+    run_category = True  # user arg.parser
+    run_clustering = True
 
     show = [None]  # 10, 50, 100, 1000, 10000,
     show_plot = False
     sort_cos_sim = True
-    # sort_cos_sim = False
-
-    # mean = None
-    # mean = 'geometric'  # 'geometric' 'harmonic' None
-    # mean = 'harmonic' # not good, try with square.
-
-    # geometric mean without normalized cos sim will fail. geometric means
-    # norm_cos=False
-    # norm_cos = True
-
-    # binary=False
-    # binary = True
-    #
-    # square=True
-    # square = False
 
     # reorganize the parameters and Modularize
 
@@ -356,291 +384,186 @@ def main():
     norm_cos_list = [True, False]
     binary_list = [True, False]
     square_list = [True, False]
-    for mean in mean_list:
-        for norm_cos in norm_cos_list:
-            if mean == "geometric" and not norm_cos:
-                continue
-            for binary in binary_list:
-                for square in square_list:
-                    annotate = 50
-                    highlight = 200
-                    parameters = ["mean=" + str(mean), "norm_cos=" + str(norm_cos), "binary=" + str(binary), "square=" + str(square)]
+    source_path = os.getcwd()
+    data_path = source_path.replace("/source", "/data/")
 
-                    dir = "../data/"
-                    for p in parameters:
-                        dir += p + ","
-                    if not os.path.exists(dir):
-                        os.mkdir(dir)
-                    # load mBERT
-                    # make an argument to switch between bert and multilingual bert
-                    # print("loading bert")
-                    # start_time = time.time()
-                    pretrained_weights = 'bert-base-uncased'  # -multilingual
-                    tokenizer_mlm = BertTokenizer.from_pretrained(pretrained_weights)
-                    model_mlm = BertForMaskedLM.from_pretrained(pretrained_weights, output_hidden_states=True)
-                    output_embeddings = model_mlm.cls.predictions.decoder.weight.detach().cpu().numpy()
-                    # print("bert is loaded", time.time()-start_time)
-                    # normalize embeddings
-                    # sum_of_rows = output_embeddings.sum(axis=1)
-                    # output_embeddings = output_embeddings / sum_of_rows[:, np.newaxis]
+    # load mBERT
+    # make an argument to switch between bert and multilingual bert
+    pretrained_weights = 'bert-base-uncased'  # -multilingual
+    tokenizer_mlm = BertTokenizer.from_pretrained(pretrained_weights)
+    model_mlm = BertForMaskedLM.from_pretrained(pretrained_weights, output_hidden_states=True)
+    output_embeddings = model_mlm.cls.predictions.decoder.weight.detach().cpu().numpy()
 
-                    # a1, a2, b1, b2 = ["man", "king", "woman", "queen"]
-                    # a1, a2, b1, b2 = ["hand", "glove", "shoe", "feet"]
-                    # a1, a2, b1, b2 = ["hand", "glove", "feet", "shoe"]
-                    # a1, a2, b1, b2 = ["hand", "glove", "foot", "shoe"]
-                    # a1, a2, b1, b2 = ["hands", "glove", "feet", "shoe"]
-                    # a1, a2, b1, b2 = ["hands", "gloves", "feet", "shoes"]
-                    b1_word_ranks = {}
-                    b2_word_ranks = {}
-                    category_word_ranks = {}
-                    category_word_baselines = {}
+    annotate = 50
+    highlight = 200
+    word_log_freq_dict = compute_log_frequency_for_lang(data_path + "en/en_50k.txt", sqrt=False)
+    word_list = list(word_log_freq_dict.keys())
+    word_list = word_list[:highlight]
 
-                    word_log_freq_dict = compute_log_frequency_for_lang(
-                        "/Users/zhugegao/PycharmProjects/BAthesis_ZG/data/en/en_50k.txt", sqrt=False)
-                    word_list = list(word_log_freq_dict.keys())
-                    word_list = word_list[:highlight]
+    if run_clustering:
+        os.chdir(source_path.replace("/source", "/data/word_lists_single_token/"))
+        all_diff_vec_list = []
+        all_diff_vec_labels = []
+        # maybe a new method read all word list
 
-                    if run_word_pair:
-                        with open("../data/word_lists/analogy_word_pairs.csv") as words:
-                            reader = csv.reader(words)
-                            baseline_b1_list = []
-                            baseline_b2_list = []
-                            rank_b1_list = []
-                            rank_b2_list = []
-                            b1_list = []
-                            b2_list = []
-                            for row in reader:
-                                a1, a2, b1, b2 = row
-                                a1_id = tokenizer_mlm.encode(a1, add_special_tokens=False)
-                                if len(a1_id) != 1: continue
-                                a1_emb = output_embeddings[a1_id]
+        category_list = glob.glob("*.csv")
+        number_of_category = len(category_list)
+        # normalize embeddings
 
-                                a2_id = tokenizer_mlm.encode(a2, add_special_tokens=False)
-                                if len(a2_id) != 1: continue
-                                a2_emb = output_embeddings[a2_id]
+        for word_list_path in category_list:
+            category = word_list_path
+            word_pair_list = []
+            with open(word_list_path) as words:
+                reader = csv.reader(words)
+                for row in reader:
+                    w1, w2 = row
+                    word_pair_list.append([w1, w2])
 
-                                b1_id = tokenizer_mlm.encode(b1, add_special_tokens=False)
-                                if len(b1_id) != 1: continue
-                                b1_emb = output_embeddings[b1_id]
+            category_diff_vec_list = get_all_diff_vecs(word_pair_list, tokenizer_mlm, output_embeddings)
+            # collect all the difference vector
 
-                                b2_id = tokenizer_mlm.encode(b2, add_special_tokens=False)
-                                if len(b2_id) != 1: continue
-                                b2_emb = output_embeddings[b2_id]
+            category_diff_vec_labels = [category] * len(category_diff_vec_list)
 
-                                new_b1_emb = a1_emb - a2_emb + b2_emb
+            all_diff_vec_list.extend(category_diff_vec_list)
+            all_diff_vec_labels.extend(category_diff_vec_labels)
 
-                                print("a1, a2, b1, b2 =[", a1, a2, b1, b2, "]")
-                                # b1_id_ranks = sort_vocab_batch(new_b1_emb, output_embeddings)
+        distances = ['Euclidean', "cosine"]
+        normalizations = [True, False]
+        for distance in distances:
+            for normalization in normalizations:
+                kmeans_cluster_diff_vectors(all_diff_vec_list, all_diff_vec_labels, number_of_category, distance=distance, normalization=normalization)
 
-                                b1_baseline_ranks, b1_baseline_cos_list = sort_vocab_with_log_freq(b2_emb, output_embeddings, tokenizer_mlm,
-                                                                                                   word_log_freq_dict,
-                                                                                                   binary_freq=binary, norm_vec=True, square=square,
-                                                                                                   norm_cos_sim_list=norm_cos,
-                                                                                                   mean=mean)
+    mean = 'geometric'
+    norm_cos = True
+    binary = False
+    square = True
 
-                                baseline_output = ""
-                                baseline_b1_list.append(list(b1_baseline_ranks).index(b1_id) + 1)
-                                # b1_word_ranks[b1] = rank_b1_list[-1]
-                                b1_baseline_rank = baseline_b1_list[-1]
-                                print(b1 + " baseline rank: " + str(b1_baseline_rank))  # [0]
-                                print_top_n_result(b1_baseline_ranks, tokenizer_mlm)
+    if run_category:
+        # run category binary switch
+        parameters = ["mean=" + str(mean), "norm_cos=" + str(norm_cos), "binary=" + str(binary),
+                      "square=" + str(square)]
+        data_dir = data_path
+        for p in parameters:
+            data_dir += p + ","
+        if not os.path.exists(data_dir):
+            os.makedirs(data_dir)
 
-                                b1_id_ranks, b1_cos_list = sort_vocab_with_log_freq(new_b1_emb, output_embeddings, tokenizer_mlm,
-                                                                                    word_log_freq_dict,
-                                                                                    binary_freq=binary, norm_vec=True, square=square,
-                                                                                    norm_cos_sim_list=norm_cos,
-                                                                                    mean=mean)
-                                parameters_b1 = parameters.copy()
-                                parameters_b1.append("(" + a2 + " > " + a1 + ")")
+        category_word_ranks = {}
+        category_word_baselines = {}
+        category_win_dict = {}
+        if run_category:
+            category_output = ""
+            os.chdir(source_path.replace("/source", "/data/word_lists_single_token/"))
 
-                                if show_plot:
-                                    for s in show:
-                                        plot_annotate_top_n(b2, b1, b1_baseline_ranks, b1_baseline_cos_list, word_list=word_list, annotate_top_n=annotate, show_top_n=s, sort_cos_sim=sort_cos_sim, tokenizer=tokenizer_mlm, parameters=parameters_b1)
-                                        plot_annotate_top_n(b2, b1, b1_id_ranks, b1_cos_list, word_list=word_list, annotate_top_n=annotate,
-                                                            show_top_n=s, sort_cos_sim=sort_cos_sim,
-                                                            tokenizer=tokenizer_mlm, parameters=parameters_b1)
+            for word_list_path in glob.glob("*"):
+                t_total = 0
+                t_hard_win = 0
+                t_soft_win = 0
+                word_ranks = {}
+                # word_baseline = {}
+                word_pair_list = []
+                baseline_list = []
+                with open(word_list_path) as words:  # {}.csv".format(category)
+                    category = word_list_path
+                    reader = csv.reader(words)
+                    for row in reader:
+                        w1, w2 = row
+                        word_pair_list.append([w1, w2])
 
-                                rank_b1_list.append(list(b1_id_ranks).index(b1_id) + 1)
-                                b1_list.append(b1)
-                                b1_word_ranks[b1] = rank_b1_list[-1]
-                                b1_rank = rank_b1_list[-1]
-                                print(b1 + " rank: " + str(b1_rank)+ "(" + str(b1_baseline_rank - b1_rank) + ")")  # [0]
-                                print_top_n_result(b1_id_ranks, tokenizer_mlm)
+                # leave one out: using a for loop
+                leave_one_out_list = [[e for e in word_pair_list if e != word_pair_list[i]] for i in
+                                      range(len(word_pair_list))]
 
-                                print("")
+                for i, l in enumerate(leave_one_out_list):
+                    w = word_pair_list[i][0].lower()
+                    w_id = tokenizer_mlm.encode(w, add_special_tokens=False)
+                    if len(w_id) != 1: continue
+                    w_emb = output_embeddings[w_id]
 
-                                new_b2_emb = a2_emb - a1_emb + b1_emb
-                                # b2_id_ranks = sort_vocab_batch(new_b2_emb, output_embeddings)
-                                b2_baseline_ranks, b2_baseline_cos_list = sort_vocab_with_log_freq(b1_emb, output_embeddings, tokenizer_mlm,
-                                                                                                   word_log_freq_dict,
-                                                                                                   binary_freq=binary, norm_vec=True, square=square,
-                                                                                                   norm_cos_sim_list=norm_cos,
-                                                                                                   mean=mean)
+                    t = word_pair_list[i][1].lower()
+                    t_id = tokenizer_mlm.encode(t, add_special_tokens=False)
+                    if len(t_id) != 1: continue
 
-                                baseline_b2_list.append(list(b2_baseline_ranks).index(b2_id) + 1)
-                                # b1_word_ranks[b1] = rank_b1_list[-1]
-                                b2_baseline_rank = baseline_b2_list[-1]
-                                print(b2 + " baseline rank: " + str(b2_baseline_rank))  # [0]
-                                print_top_n_result(b2_baseline_ranks, tokenizer_mlm)
+                    avg_vec, category_diff_vec_list = get_average_vec_for_category(w, l, tokenizer_mlm,
+                                                                                   output_embeddings)
 
-                                parameters_b2 = parameters.copy()
-                                parameters_b2.append("(" + a1 + " > " + a2 + ")")
-                                b2_id_ranks, b2_cos_list = sort_vocab_with_log_freq(new_b2_emb, output_embeddings, tokenizer_mlm,
-                                                                                    word_log_freq_dict,
-                                                                                    binary_freq=binary, norm_vec=True, square=square,
-                                                                                    norm_cos_sim_list=norm_cos,
-                                                                                    mean=mean)
+                    t_emb_new = w_emb + avg_vec
+                    # print(w, t)
+                    baseline_ranks, baseline_cos_list = sort_vocab_with_log_freq(w_emb, w, output_embeddings,
+                                                                                 tokenizer_mlm,
+                                                                                 word_log_freq_dict,
+                                                                                 binary_freq=binary, norm_vec=True,
+                                                                                 square=square,
+                                                                                 norm_cos_sim_list=norm_cos,
+                                                                                 mean=mean)
+                    baseline_list.append(list(baseline_ranks).index(t_id) + 1)
 
-                                rank_b2_list.append(list(b2_id_ranks).index(b2_id) + 1)
-                                b2_list.append(b2)
-                                b2_word_ranks[b2] = rank_b2_list[-1]
-                                b2_rank = rank_b2_list[-1]
-                                print(b2 + " rank: " + str(b2_rank) + "(" + str(b2_baseline_rank - b2_rank) + ")")
-                                print_top_n_result(b2_id_ranks, tokenizer_mlm)
-                                if show_plot:
-                                    for s in show:
-                                        plot_annotate_top_n(b1, b2, b2_baseline_ranks, b2_baseline_cos_list, word_list=word_list, annotate_top_n=annotate, show_top_n=s, sort_cos_sim=sort_cos_sim, tokenizer=tokenizer_mlm, parameters=parameters_b2)
-                                        plot_annotate_top_n(b1, b2, b2_id_ranks, b2_cos_list, word_list=word_list, annotate_top_n=annotate,
-                                                            show_top_n=s, sort_cos_sim=sort_cos_sim,
-                                                            tokenizer=tokenizer_mlm, parameters=parameters_b2)
-                                # print("avg b2: " + str(average(b2_id_ranks)))
+                    baseline = baseline_list[-1]
 
-                    if run_category:
-                        categories_word_list = ["instrument", "instrument_inv", "crime", "crime_inv", "growth", "growth_inv",
-                                                "profession", "profession_inv"]
-                        # remove the single_token in file namesx
-                        # use glob on the .csv files. It's better? Or this. This give you choices
-                        category_output = ""
-                        os.chdir("../data/word_lists_single_token/")
+                    t_id_ranks, t_cos_list = sort_vocab_with_log_freq(t_emb_new, w, output_embeddings,
+                                                                      tokenizer_mlm,
+                                                                      word_log_freq_dict, binary_freq=binary,
+                                                                      norm_vec=True, square=square,
+                                                                      norm_cos_sim_list=norm_cos, mean=mean)
+                    parameters_t = parameters.copy()
+                    # former plot
+                    target = w + ">" + t
+                    t_rank = list(t_id_ranks).index(t_id) + 1
 
-                        for word_list_path in glob.glob("*"):
-                        # for category in categories_word_list:
-                            t_total = 0
-                            t_win = 0
-                            word_ranks = {}
-                            # word_baseline = {}
-                            word_pair_list = []
-                            baseline_list = []
-                            with open(word_list_path) as words: #{}.csv".format(category)
-                                # category = word_list_path.replace("_single_token.csv","")
-                                category = word_list_path
-                                print(category)
-                                reader = csv.reader(words)
-                                for row in reader:
-                                    w1, w2 = row
-                                    word_pair_list.append([w1, w2])
+                    word_ranks[target] = str(t_rank) + "(" + str(baseline - t_rank) + ")"
+                    # print(t + " baseline rank: " + str(baseline))  # [0]
+                    # print_top_n_result(baseline_ranks, tokenizer_mlm)
+                    # print(t + " rank: " + str(t_rank) + "(" + str(baseline - t_rank) + ")")  # [0]
+                    # print_top_n_result(t_id_ranks, tokenizer_mlm)
+                    if baseline >= t_rank:
+                        t_soft_win += 1
+                    if baseline > t_rank:
+                        t_hard_win += 1
+                    t_total += 1
+                    if show_plot:
+                        for s in show:
+                            plot_annotate_top_n(w, t, baseline_ranks, baseline_cos_list, word_list=word_list,
+                                                annotate_top_n=annotate,
+                                                show_top_n=s, sort_cos_sim=sort_cos_sim, tokenizer=tokenizer_mlm,
+                                                parameters=parameters_t)
+                            plot_annotate_top_n(w, t, t_id_ranks, t_cos_list, word_list=word_list,
+                                                annotate_top_n=annotate,
+                                                show_top_n=s, sort_cos_sim=sort_cos_sim, tokenizer=tokenizer_mlm,
+                                                parameters=parameters_t)
+                category_word_ranks[category] = word_ranks
+                category_output += category + " improve from baseline: " + str(t_hard_win) + " out of " + str(
+                    t_total) + "\n"
+                # print(category + " improve from baseline: " + str(t_hard_win) + " out of " + str(t_total))
+                # print(category + "," + str(round(t_hard_win / t_total, 3)) + "," + str(
+                #     round(t_soft_win / t_total, 3)))
+                category_win_dict[category] = [round(t_hard_win / t_total, 3), round(t_soft_win / t_total, 3)]
+            # print("")
+            # print(category_output)
+            category_file_list = glob.glob("*")  # for code readability
+            print("")
+            print("category,avg_baseline_rank,avg_rank,acc@1,acc@10,acc@50,acc@100,hard_win,soft_win")
+            for c in category_file_list:
+                ranks = []
+                improve_from_baselines = []
+                baseline = []
+                for v in category_word_ranks[c].values():
+                    ranks.append(int(v[:v.index("(")]))
+                    improve_from_baselines.append(int(v[v.index("(") + 1:v.index(")")]))
+                    baseline.append(ranks[-1] + improve_from_baselines[-1])  # optimize
 
-                            # leave one out: using a for loop
-                            leave_one_out_list = [[e for e in word_pair_list if e != word_pair_list[i]] for i in range(len(word_pair_list))]
+                ranks_stats = get_stats_for_list(ranks)
+                ranks_stats.insert(0, round(statistics.mean(baseline), 3))
+                ranks_stats.extend(category_win_dict[c])
 
-                            for i, l in enumerate(leave_one_out_list):
-                                w = word_pair_list[i][0]
-                                w_id = tokenizer_mlm.encode(w, add_special_tokens=False)
-                                if len(w_id) != 1: continue
-                                w_emb = output_embeddings[w_id]
-
-                                t = word_pair_list[i][1]
-                                t_id = tokenizer_mlm.encode(t, add_special_tokens=False)
-                                if len(t_id) != 1: continue
-
-                                avg_vec, category_diff_vec_list = get_average_vec_for_category(w, l, tokenizer_mlm, output_embeddings)
-                                # collect all the difference vector
-
-
-                    #             t_emb_new = w_emb + avg_vec
-                    #             print(w, t)
-                    #             baseline_ranks, baseline_cos_list = sort_vocab_with_log_freq(w_emb, output_embeddings, tokenizer_mlm,
-                    #                                                          word_log_freq_dict, binary_freq=binary, norm_vec=True,
-                    #                                                          square=square, norm_cos_sim_list=norm_cos, mean=mean)
-                    #             baseline_list.append(list(baseline_ranks).index(t_id) + 1)
-                    #             # b1_word_ranks[b1] = rank_b1_list[-1]
-                    #             baseline = baseline_list[-1]
-                    #             print(t + " baseline rank: " + str(baseline))  # [0]
-                    #             print_top_n_result(baseline_ranks, tokenizer_mlm)
-                    #
-                    #             t_id_ranks, t_cos_list = sort_vocab_with_log_freq(t_emb_new, output_embeddings, tokenizer_mlm,
-                    #                                                               word_log_freq_dict, binary_freq=binary,
-                    #                                                               norm_vec=True, square=square,
-                    #                                                               norm_cos_sim_list=norm_cos, mean=mean)
-                    #             parameters_t = parameters.copy()
-                    #             parameters_t.append("category=" + category)
-                    #             # former plot
-                    #             target = w + ">" + t
-                    #             t_rank = list(t_id_ranks).index(t_id) + 1
-                    #             word_ranks[target] = str(t_rank) + "(" + str(baseline - t_rank) + ")"
-                    #
-                    #             print(t + " rank: " + str(t_rank) + "(" + str(baseline - t_rank) + ")")  # [0]
-                    #             print_top_n_result(t_id_ranks, tokenizer_mlm)
-                    #             if baseline > t_rank:
-                    #                 t_win += 1
-                    #             t_total += 1
-                    #             if show_plot:
-                    #                 for s in show:
-                    #                     plot_annotate_top_n(w, t, baseline_ranks, baseline_cos_list, word_list=word_list, annotate_top_n=annotate,
-                    #                                         show_top_n=s, sort_cos_sim=sort_cos_sim, tokenizer=tokenizer_mlm,
-                    #                                         parameters=parameters_t)
-                    #                     plot_annotate_top_n(w, t, t_id_ranks, t_cos_list, word_list=word_list, annotate_top_n=annotate,
-                    #                                         show_top_n=s, sort_cos_sim=sort_cos_sim, tokenizer=tokenizer_mlm,
-                    #                                         parameters=parameters_t)
-                    #         category_word_ranks[category] = word_ranks
-                    #
-                    #         category_output += category + " improve from baseline: " + str(t_win) + " out of " + str(t_total) + "\n"
-                    #         print(category + " improve from baseline: " + str(t_win) + " out of " + str(t_total))
-                    #     print("")
-                    #     print(category_output)
-                    # if run_word_pair:
-                    #     print(parameters_b1)
-                    # if run_category:
-                    #     print(parameters_t)
-                    #
-                    # if run_word_pair:
-                    #     b1_output = ""
-                    #     # b1_output1 = ""
-                    #     b1_win = 0
-                    #     for b1, baseline, b1_rank in zip(b1_list, baseline_b1_list, rank_b1_list):
-                    #         # b1_output1 += str(b1_rank) + ","
-                    #         # b1_output += (b1 + ": " + str(baseline) + "|" + str(b1_rank) + ",").rjust(15)
-                    #         b1_output += (b1 + ": " + str(b1_rank) + "(" + str(baseline - b1_rank) + ")" + ",").rjust(15)
-                    #         if baseline > b1_rank:
-                    #             b1_win += 1
-                    #     print(b1_output)
-                    #     # print(b1_output1)
-                    #     rank_b1_list = add_stats_to_list(rank_b1_list)
-                    #     print(str(rank_b1_list)[1:-1])
-                    #     print("b1 improve from baseline: " + str(b1_win) + " out of " + str(len(b1_list)))
-                    #
-                    #     b2_output = ""
-                    #     # b2_output1 = ""
-                    #     b2_win = 0
-                    #     for b2, baseline, b2_rank in zip(b2_list, baseline_b2_list, rank_b2_list):
-                    #         # b2_output1 += str(b2_rank) + ","
-                    #         # b2_output += (b2 + ": " + str(baseline) + "|" + str(b2_rank) + ",").rjust(15)
-                    #         b2_output += (b2 + ": " + str(b2_rank) + "(" + str(baseline - b2_rank) + ")" + ",").rjust(15)
-                    #         if baseline > b2_rank:
-                    #             b2_win += 1
-                    #     print(b2_output)
-                    #     rank_b2_list = add_stats_to_list(rank_b2_list)
-                    #     print(str(rank_b2_list)[1:-1])
-                    #     print("b2 improve from baseline: " + str(b2_win) + " out of " + str(len(b2_list)))
-                    #
-                    #     # with open('file.csv', 'a') as f:
-                    #     #     print('hello world', file=f)
-                    # print("")
-                    # if run_category:
-                    #     # os.chdir("../data/word_lists_single_token/")
-                    #     for c in glob.glob("*"):
-                    #     # for c in categories_word_list:
-                    #         print(c)
-                    #         print(category_word_ranks[c])
-                    #         print(str(list(category_word_ranks[c].values()))[1:-1].replace("'",""))
-                    #         values = []
-                    #         for v in category_word_ranks[c].values():
-                    #             values.append(int(v[:v.index("(")]))
-                    #         values = add_stats_to_list(values)
-                    #         print(str(values)[1:-1])
-                    #         print(dict(sorted(category_word_ranks[c].items(), key=lambda item: item[1])))
-                    #         print("")
+                print(c + "," + str(ranks_stats)[1:-1])
+            print("")
+            print("category, base>derivate : rank(improve_from_baseline)")
+            for c in category_file_list:
+                print(c + "," + str(category_word_ranks[c])[1:-1].replace("'",""))
+                # print(c + "," + str(sorted(category_word_ranks[c].items(), key=lambda item: item[1])))
 
 
 if __name__ == "__main__":
+    start_time = time.time()
     main()
+    print("--- %s seconds ---" % (time.time() - start_time))
